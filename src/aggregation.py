@@ -62,6 +62,8 @@ class Aggregation():
             aggregated_updates = self.agg_rfa(agent_updates_dict)
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
+        elif self.args.aggr == 'scopemm':
+            aggregated_updates = self.agg_scope_multimetric(agent_updates_dict, self.global_model, cur_global_params)
     
         updates_dict = vector_to_name_param(aggregated_updates, copy.deepcopy(global_model.state_dict()))
 
@@ -404,6 +406,191 @@ class Aggregation():
         current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
+   
+    def agg_scope_multimetric(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        Scope-style multi-metric defense adapted to aggregation setting.
+        - Build per-client model vectors as (flat_global_model + update)
+        - Compute relative change pre-metric
+        - Multi-metric pairwise distances (cosine, L1, L2), z-score standardize and combine
+        - MPSA-based prefilter on updates
+        - Wave expansion from a seed in allowed set to select clients
+        - Weighted average of selected updates by agent_data_sizes
+        """
+        eps = getattr(self.args, "eps", 1e-12)
+        sparsity = getattr(self.args, "sparsity", 0.3)
+        lambda_s = getattr(self.args, "lambda_s", 1.0)
+        percent_select = float(getattr(self.args, "percent_select", 20.0))
+        combine_method = getattr(self.args, "combine_method", "max")
+
+        # Maintain client id order for weighting and build label lists
+        client_ids = []
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+        for _id, update in agent_updates_dict.items():
+            client_ids.append(_id)
+            local_updates.append(update)
+            if _id < self.args.num_malicious_clients:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        # Build client model vectors (numpy)
+        vectorize_global = flat_global_model.detach().cpu().numpy()
+        client_model_vecs = []
+        for upd in local_updates:
+            client_model_vecs.append((flat_global_model + upd).detach().cpu().numpy())
+
+        # Step: relative change pre-metric
+        pre_metric_dis = []
+        for g_i in client_model_vecs:
+            pre_metric = np.power(np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + eps), 2.0) * np.sign(g_i - vectorize_global)
+            pre_metric_dis.append(pre_metric)
+
+        n = len(pre_metric_dis)
+        if n == 0:
+            return torch.zeros_like(flat_global_model)
+        if n == 1:
+            return local_updates[0]
+
+        # Multi-metric pairwise distances
+        cos_mat = np.zeros((n, n), dtype=np.float64)
+        l1_mat = np.zeros((n, n), dtype=np.float64)
+        l2_mat = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            gi = pre_metric_dis[i]
+            ni = np.linalg.norm(gi) + eps
+            for j in range(i + 1, n):
+                gj = pre_metric_dis[j]
+                nj = np.linalg.norm(gj) + eps
+                cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+                manhattan_distance = float(np.linalg.norm(gi - gj, ord=1))
+                euclidean_distance = float(np.linalg.norm(gi - gj))
+                cos_mat[i, j] = cos_mat[j, i] = cosine_distance
+                l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
+                l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
+
+        # z-score each metric using upper triangle stats
+        std_mats = []
+        for M in (cos_mat, l1_mat, l2_mat):
+            triu = M[np.triu_indices_from(M, k=1)]
+            mean = np.mean(triu) if triu.size > 0 else 0.0
+            std = np.std(triu) if triu.size > 0 else 1.0
+            std = std if std > eps else 1.0
+            Z = (M - mean) / std
+            std_mats.append(Z)
+        cosZ, l1Z, l2Z = std_mats
+
+        # Combine
+        combined_D = np.zeros((n, n), dtype=np.float64)
+        if combine_method == "euclidean":
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        elif combine_method == "max":
+            combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+        elif combine_method == "mahalanobis":
+            idx_i, idx_j = np.triu_indices(n, k=1)
+            feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)
+            cov = np.cov(feats.T)
+            try:
+                inv = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                inv = np.eye(3)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    v = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    d = float(v.T @ inv @ v)
+                    combined_D[i, j] = combined_D[j, i] = d
+        else:
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        np.fill_diagonal(combined_D, 0.0)
+
+        # MPSA prefilter on updates (torch)
+        inter_model_updates = torch.stack(local_updates, dim=0)  # updates w.r.t global
+        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+        topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
+        mpsa_list = []
+        for i in range(inter_model_updates.shape[0]):
+            vec_i = inter_model_updates[i]
+            abs_i = torch.abs(vec_i)
+            _, init_indices = torch.topk(abs_i, topk_dim)
+            agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
+            mpsa = agree / float(init_indices.numel())
+            mpsa_list.append(mpsa)
+        # MZ-score on MPSA
+        mpsa_arr = np.array(mpsa_list, dtype=np.float64)
+        mpsa_std = np.std(mpsa_arr)
+        mpsa_med = np.median(mpsa_arr)
+        mpsa_std = mpsa_std if mpsa_std > eps else 1.0
+        mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
+        allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
+        if len(allowed_indices) == 0:
+            logging.info("[ScopeMM] MPSA未筛出良性客户端，退化为使用全部客户端")
+            allowed_indices = list(range(n))
+
+        # Wave expansion on allowed set
+        sum_dis_full = np.sum(combined_D, axis=1)
+        seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
+        cluster = set([seed_local])
+        visited = set([seed_local])
+        front = set([seed_local])
+        cur_percent = float(percent_select)
+        allowed_arr = np.array(allowed_indices, dtype=int)
+        while cur_percent > 0 and len(front) > 0:
+            k = max(1, int(round(len(allowed_indices) * (cur_percent / 100.0))))
+            next_front = set()
+            for u in front:
+                dists = combined_D[u, allowed_arr]
+                neigh_pos = np.argsort(dists)[:k]
+                neighbors = allowed_arr[neigh_pos]
+                for v in neighbors:
+                    if int(v) not in visited:
+                        next_front.add(int(v))
+            if len(next_front) == 0:
+                break
+            cluster |= next_front
+            visited |= next_front
+            front = next_front
+            cur_percent /= 2.0
+        selected = sorted(list(cluster))
+
+        # Weighted average of selected updates
+        if len(selected) == 0:
+            return torch.zeros_like(local_updates[0])
+        selected_ids = [client_ids[i] for i in selected]
+        total = 0.0
+        for cid in selected_ids:
+            total += float(self.agent_data_sizes[cid])
+        if total <= 0:
+            weights = [1.0 / len(selected)] * len(selected)
+        else:
+            weights = [float(self.agent_data_sizes[cid]) / total for cid in selected_ids]
+        stacked = torch.stack([local_updates[i] for i in selected], dim=0)
+        w_tensor = torch.tensor(weights, device=stacked.device, dtype=stacked.dtype).view(-1, 1)
+        aggregated = torch.sum(stacked * w_tensor, dim=0)
+
+        # Metrics logging similar to reference
+        benign_idx = selected
+        correct = 0
+        for idx in benign_idx:
+            if client_ids[idx] >= self.args.num_malicious_clients:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+        if len(malicious_id) == 0:
+            FPR = 0.0
+        else:
+            wrong = 0
+            for idx in benign_idx:
+                if client_ids[idx] < self.args.num_malicious_clients:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str(benign_idx))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+        self.tpr_history.append(TPR)
+        self.fpr_history.append(FPR)
+        return aggregated
    
     def agg_deepsight(self, agent_updates_dict, global_model, flat_global_model):
         """

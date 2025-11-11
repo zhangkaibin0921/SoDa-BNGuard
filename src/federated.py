@@ -73,7 +73,7 @@ if __name__ == "__main__":
     parser.add_argument('--alpha',type=float, default=0.5)
     parser.add_argument('--attack',type=str, default="soda", choices=['soda', 'og'])
     parser.add_argument('--aggr', type=str, default='avg', choices=['avg', 'bnguard', 'rlr', 'mkrum', 'signguard',
-                                                                    'mmetric', 'foolsgold', 'rfa', 'deepsight', 'flame',"alignins"],
+                                                                    'mmetric', 'foolsgold', 'rfa', 'deepsight', 'flame',"alignins", "scopemm"],
                         help="aggregation function to aggregate agents' local weights")
     parser.add_argument('--lr_decay',type=float, default=0.99)
     parser.add_argument('--momentum',type=float, default=0.0)
