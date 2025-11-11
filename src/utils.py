@@ -332,7 +332,7 @@ def setup_logging(args):
     backup_file = ['aggregation.py', 'federated.py', 'agent.py']
 
     for file in backup_file:
-        copyfile('src/%s' % file, file_path + file)
+        copyfile('./%s' % file, file_path + file)
 
     fileHandler = logging.FileHandler("{0}/{1}.log".format(dir_path, fileName))
     fileHandler.setFormatter(logFormatter)
