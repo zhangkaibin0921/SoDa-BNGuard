@@ -60,6 +60,8 @@ class Aggregation():
             aggregated_updates = self.agg_flame(agent_updates_dict, cur_global_params)
         elif self.args.aggr == "rfa":
             aggregated_updates = self.agg_rfa(agent_updates_dict)
+        elif self.args.aggr == 'alignins':
+            aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
     
         updates_dict = vector_to_name_param(aggregated_updates, copy.deepcopy(global_model.state_dict()))
 
@@ -267,6 +269,141 @@ class Aggregation():
         self.fpr_history.append(WSR)
 
         return sum(return_gradient)/len(return_gradient)
+
+    def agg_alignins(self, agent_updates_dict, flat_global_model):
+        local_updates = []
+        benign_id = []  # 实际干净的客户端ID（真实标签）
+        malicious_id = []  # 实际恶意的客户端ID（真实标签）
+
+        for _id, update in agent_updates_dict.items():
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        chosen_clients = malicious_id + benign_id  # 所有客户端ID列表（恶意+干净）
+        num_chosen_clients = len(chosen_clients)
+        inter_model_updates = torch.stack(local_updates, dim=0)
+
+        tda_list = []
+        mpsa_list = []
+        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+        cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
+        for i in range(len(inter_model_updates)):
+            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]),
+                                         int(len(inter_model_updates[i]) * self.args.sparsity))
+            # 计算MPSA
+            mpsa = (torch.sum(
+                torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
+                inter_model_updates[i][init_indices])).item()
+            mpsa_list.append(mpsa)
+            # 计算TDA
+            tda = cos(inter_model_updates[i], flat_global_model).item()
+            tda_list.append(tda)
+
+        logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
+        logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+
+        ######## MZ-score calculation ########
+        # MPSA的MZ-score
+        mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
+        mpsa_med = np.median(mpsa_list)
+        mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
+        logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
+
+        # TDA的MZ-score
+        tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+        tda_med = np.median(tda_list)
+        mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
+        logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
+
+        ######## Anomaly detection with MZ score ########
+        # MPSA筛选出的良性索引（chosen_clients的索引）
+        benign_idx1 = set(range(num_chosen_clients))
+        benign_idx1.intersection_update(
+            set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int)))
+
+        # TDA筛选出的良性索引（chosen_clients的索引）
+        benign_idx2 = set(range(num_chosen_clients))
+        benign_idx2.intersection_update(
+            set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
+
+        ######## 计算MPSA和TDA的Precision并打印 ########
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            """
+            计算Precision：真正干净数 / 选中数
+            selected_indices：筛选出的索引（对应chosen_ids的索引）
+            chosen_ids：所有客户端ID列表（malicious_id + benign_id）
+            actual_benign_ids：实际干净的客户端ID列表（真实标签）
+            """
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            # 统计选中的客户端中实际干净的数量
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]  # 索引对应的实际客户端ID
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        # MPSA的Precision
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(benign_idx1, chosen_clients, benign_id)
+        if mpsa_precision is not None:
+            logging.info(
+                f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
+        else:
+            logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
+
+        # TDA的Precision
+        tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
+        if tda_precision is not None:
+            logging.info(
+                f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
+        else:
+            logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
+
+        ######## 后续原有逻辑 ########
+        benign_set = benign_idx2.intersection(benign_idx1)
+        benign_idx = list(benign_set)
+        if len(benign_idx) == 0:
+            return torch.zeros_like(local_updates[0])
+
+        benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
+
+        ######## Post-filtering model clipping ########
+        updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+        norm_clip = updates_norm.median(dim=0)[0].item()
+        benign_updates = torch.stack(local_updates, dim=0)
+        updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+        updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
+        benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
+
+        ######## 原有TPR/FPR计算 ########
+        correct = 0
+        for idx in benign_idx:
+            if chosen_clients[idx] in benign_id:  # 修正：用实际ID判断是否干净
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+
+        FPR = 0.0
+        if len(malicious_id) > 0:
+            wrong = 0
+            for idx in benign_idx:
+                if chosen_clients[idx] in malicious_id:  # 修正：用实际ID判断是否恶意
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str(benign_idx))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+
+        current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        aggregated_update = self.agg_avg(current_dict)
+        return aggregated_update
    
     def agg_deepsight(self, agent_updates_dict, global_model, flat_global_model):
         """
