@@ -528,6 +528,24 @@ class Aggregation():
             logging.info("[ScopeMM] MPSA未筛出良性客户端，退化为使用全部客户端")
             allowed_indices = list(range(n))
 
+        # MPSA precision logging (chosen = allowed_indices)
+        def _calc_precision(selected_indices, id_list, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = id_list[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(allowed_indices, client_ids, benign_id)
+        if mpsa_precision is not None:
+            logging.info(f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
+        else:
+            logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
+
         # Wave expansion on allowed set
         sum_dis_full = np.sum(combined_D, axis=1)
         seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
@@ -536,6 +554,7 @@ class Aggregation():
         front = set([seed_local])
         cur_percent = float(percent_select)
         allowed_arr = np.array(allowed_indices, dtype=int)
+        round_idx = 1
         while cur_percent > 0 and len(front) > 0:
             k = max(1, int(round(len(allowed_indices) * (cur_percent / 100.0))))
             next_front = set()
@@ -548,10 +567,17 @@ class Aggregation():
                         next_front.add(int(v))
             if len(next_front) == 0:
                 break
+            # Branch-1 per-round logging with malicious counts (local IDs)
+            added_local_sorted = sorted(list(next_front))
+            added_client_ids = [client_ids[i] for i in added_local_sorted]
+            malicious_added = [cid for cid in added_client_ids if cid < self.args.num_malicious_clients]
+            logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 新加入恶意客户端数: {len(malicious_added)} | 恶意客户端局部ID: {malicious_added}")
+            logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 本轮加入客户端个数: {len(next_front)}")
             cluster |= next_front
             visited |= next_front
             front = next_front
             cur_percent /= 2.0
+            round_idx += 1
         selected = sorted(list(cluster))
 
         # Weighted average of selected updates
