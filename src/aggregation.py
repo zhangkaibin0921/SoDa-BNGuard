@@ -277,7 +277,7 @@ class Aggregation():
 
         for _id, update in agent_updates_dict.items():
             local_updates.append(update)
-            if _id < self.args.num_corrupt:
+            if _id < self.args.num_malicious_clients:
                 malicious_id.append(_id)
             else:
                 benign_id.append(_id)

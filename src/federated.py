@@ -79,6 +79,9 @@ if __name__ == "__main__":
     parser.add_argument('--momentum',type=float, default=0.0)
     parser.add_argument('--wd', type=float, default= 1e-4)
     parser.add_argument('--exp_name_extra', type=str, default='')
+    parser.add_argument("--sparsity", type=float, default=0.3)
+    parser.add_argument("--lambda_s", type=float, default=1.0)
+    parser.add_argument("--lambda_c", type=float, default=1.0)
     args = parser.parse_args()
     
     
