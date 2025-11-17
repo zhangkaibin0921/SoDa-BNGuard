@@ -422,6 +422,11 @@ class Aggregation():
         lambda_s = getattr(self.args, "lambda_s", 1.0)
         percent_select = float(getattr(self.args, "percent_select", 20.0))
         combine_method = getattr(self.args, "combine_method", "max")
+        use_candidate_seed = bool(getattr(self.args, "use_candidate_seed", True))
+        use_mpsa_prefilter = bool(getattr(self.args, "use_mpsa_prefilter", True))
+        self.candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.25))
+        # FedID dynamic weighting regularization coefficient
+        self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
 
         # Maintain client id order for weighting and build label lists
         client_ids = []
@@ -501,32 +506,70 @@ class Aggregation():
                     v = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
                     d = float(v.T @ inv @ v)
                     combined_D[i, j] = combined_D[j, i] = d
+        elif combine_method == "fedid_dynamic":  # 新增：FedID动态加权策略
+            # 步骤1：构建每个客户端的三维距离特征向量（对所有其他客户端的距离取平均）
+            client_features = np.zeros((n, 3), dtype=np.float64)  # [n, 3]：n个客户端，3种度量
+            for i in range(n):
+                mask = np.arange(n) != i  # 排除自身距离（对角线）
+                # client_features[i, 0] = np.mean(cosZ[i, mask])  # 余弦距离均值
+                # client_features[i, 1] = np.mean(l1Z[i, mask])  # L1距离均值
+                # client_features[i, 2] = np.mean(l2Z[i, mask])  # L2距离均值
+                client_features[i, 0] = np.sum(cosZ[i, mask])  # 余弦距离总和
+                client_features[i, 1] = np.sum(l1Z[i, mask])  # L1距离总和
+                client_features[i, 2] = np.sum(l2Z[i, mask])  # L2距离总和
+
+            # 步骤2：计算浓度矩阵（协方差矩阵的逆，加入正则化）
+            cov_matrix = np.cov(client_features.T)  # 3x3协方差矩阵（反映度量间相关性）
+            reg_cov = cov_matrix + self.fedid_reg * np.eye(3)  # 正则化，避免奇异
+            try:
+                concentration_matrix = np.linalg.inv(reg_cov)  # 浓度矩阵（动态权重核心）
+                logging.info(f"[FedID动态加权] 浓度矩阵计算完成，正则化系数={self.fedid_reg}")
+            except np.linalg.LinAlgError:
+                # 极端情况：协方差矩阵无法求逆，退化为单位矩阵（等权重）
+                concentration_matrix = np.eye(3)
+                logging.warning("[FedID动态加权] 协方差矩阵奇异，退化为单位矩阵加权")
+
+            # 步骤3：用浓度矩阵对距离向量进行白化处理（动态加权融合）
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # 客户端i和j的三维距离向量（标准化后）
+                    dist_vec = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    # 白化处理：通过浓度矩阵自适应加权（二次型计算）
+                    dynamic_dist = dist_vec.T @ concentration_matrix @ dist_vec
+                    # 确保距离非负（理论上应为非负，实际加安全保障）
+                    combined_D[i, j] = combined_D[j, i] = max(dynamic_dist, 0.0)
         else:
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         np.fill_diagonal(combined_D, 0.0)
 
         # MPSA prefilter on updates (torch)
-        inter_model_updates = torch.stack(local_updates, dim=0)  # updates w.r.t global
-        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
-        topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
-        mpsa_list = []
-        for i in range(inter_model_updates.shape[0]):
-            vec_i = inter_model_updates[i]
-            abs_i = torch.abs(vec_i)
-            _, init_indices = torch.topk(abs_i, topk_dim)
-            agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
-            mpsa = agree / float(init_indices.numel())
-            mpsa_list.append(mpsa)
-        # MZ-score on MPSA
-        mpsa_arr = np.array(mpsa_list, dtype=np.float64)
-        mpsa_std = np.std(mpsa_arr)
-        mpsa_med = np.median(mpsa_arr)
-        mpsa_std = mpsa_std if mpsa_std > eps else 1.0
-        mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
-        allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
-        if len(allowed_indices) == 0:
-            logging.info("[ScopeMM] MPSA未筛出良性客户端，退化为使用全部客户端")
+        if use_mpsa_prefilter:
+            inter_model_updates = torch.stack(local_updates, dim=0)  # updates w.r.t global
+            major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+            topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
+            mpsa_list = []
+            for i in range(inter_model_updates.shape[0]):
+                vec_i = inter_model_updates[i]
+                abs_i = torch.abs(vec_i)
+                _, init_indices = torch.topk(abs_i, topk_dim)
+                agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
+                mpsa = agree / float(init_indices.numel())
+                mpsa_list.append(mpsa)
+            # MZ-score on MPSA
+            mpsa_arr = np.array(mpsa_list, dtype=np.float64)
+            mpsa_std = np.std(mpsa_arr)
+            mpsa_med = np.median(mpsa_arr)
+            mpsa_std = mpsa_std if mpsa_std > eps else 1.0
+            mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
+            allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
+            if len(allowed_indices) == 0:
+                logging.info("[ScopeMM] MPSA未筛出良性客户端，退化为使用全部客户端")
+                allowed_indices = list(range(n))
+            allowed_indices = sorted(allowed_indices)
+        else:
+            # No MPSA prefilter: use all clients as allowed set
             allowed_indices = list(range(n))
+            logging.info("[ScopeMM] 已关闭MPSA预筛选，使用全部客户端作为允许集合")
 
         # MPSA precision logging (chosen = allowed_indices)
         def _calc_precision(selected_indices, id_list, actual_benign_ids):
@@ -547,8 +590,38 @@ class Aggregation():
             logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
 
         # Wave expansion on allowed set
-        sum_dis_full = np.sum(combined_D, axis=1)
-        seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
+        if use_candidate_seed:
+            allowed_arr = np.array(allowed_indices, dtype=int)
+            if len(allowed_arr) == 0:
+                logging.info("[ScopeMultiMetricDefense] 候选种子阶段允许集合为空，退化为使用全部客户端")
+                allowed_indices = list(range(n))
+                allowed_arr = np.array(allowed_indices, dtype=int)
+            sum_dis_allowed = np.zeros(len(allowed_indices))
+            for idx, local_i in enumerate(allowed_indices):
+                mask = allowed_arr != local_i
+                sum_dis_allowed[idx] = np.sum(combined_D[local_i, allowed_arr[mask]])
+            num_candidates = max(1, int(len(allowed_indices) * self.candidate_seed_ratio))
+            sorted_candidate_indices = np.argsort(sum_dis_allowed)[:num_candidates]
+            candidate_seeds = [allowed_indices[i] for i in sorted_candidate_indices]
+            logging.info(
+                f"[种子选择] 候选种子比例：{self.candidate_seed_ratio}，候选种子：{candidate_seeds}，共{len(candidate_seeds)}个")
+            if len(candidate_seeds) == 1:
+                seed_local = candidate_seeds[0]
+            else:
+                candidate_dist_sum = []
+                for seed in candidate_seeds:
+                    other_candidates = [s for s in candidate_seeds if s != seed]
+                    if len(other_candidates) == 0:
+                        dist_sum = 0.0
+                    else:
+                        dist_sum = np.sum(combined_D[seed, other_candidates])
+                    candidate_dist_sum.append(dist_sum)
+                best_candidate_idx = int(np.argmin(candidate_dist_sum))
+                seed_local = candidate_seeds[best_candidate_idx]
+                logging.info(f"[种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子：{seed_local}")
+        else:
+            sum_dis_full = np.sum(combined_D, axis=1)
+            seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
         cluster = set([seed_local])
         visited = set([seed_local])
         front = set([seed_local])
