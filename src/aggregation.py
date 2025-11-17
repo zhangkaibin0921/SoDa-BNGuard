@@ -276,6 +276,7 @@ class Aggregation():
         local_updates = []
         benign_id = []  # 实际干净的客户端ID（真实标签）
         malicious_id = []  # 实际恶意的客户端ID（真实标签）
+        use_alignins_mpsa_only = bool(getattr(self.args, "use_alignins_mpsa_only", False))
 
         for _id, update in agent_updates_dict.items():
             local_updates.append(update)
@@ -288,8 +289,8 @@ class Aggregation():
         num_chosen_clients = len(chosen_clients)
         inter_model_updates = torch.stack(local_updates, dim=0)
 
-        tda_list = []
         mpsa_list = []
+        tda_list = []
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
         for i in range(len(inter_model_updates)):
@@ -300,12 +301,14 @@ class Aggregation():
                 torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
                 inter_model_updates[i][init_indices])).item()
             mpsa_list.append(mpsa)
-            # 计算TDA
-            tda = cos(inter_model_updates[i], flat_global_model).item()
-            tda_list.append(tda)
+            if not use_alignins_mpsa_only:
+                # 计算TDA
+                tda = cos(inter_model_updates[i], flat_global_model).item()
+                tda_list.append(tda)
 
-        logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
         logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+        if not use_alignins_mpsa_only:
+            logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
 
         ######## MZ-score calculation ########
         # MPSA的MZ-score
@@ -314,11 +317,12 @@ class Aggregation():
         mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
         logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
 
-        # TDA的MZ-score
-        tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
-        tda_med = np.median(tda_list)
-        mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
-        logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
+        # TDA的MZ-score（仅在未启用MPSA-only模式时计算）
+        if not use_alignins_mpsa_only:
+            tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+            tda_med = np.median(tda_list)
+            mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
+            logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
 
         ######## Anomaly detection with MZ score ########
         # MPSA筛选出的良性索引（chosen_clients的索引）
@@ -326,10 +330,11 @@ class Aggregation():
         benign_idx1.intersection_update(
             set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int)))
 
-        # TDA筛选出的良性索引（chosen_clients的索引）
-        benign_idx2 = set(range(num_chosen_clients))
-        benign_idx2.intersection_update(
-            set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
+        # TDA筛选出的良性索引（chosen_clients的索引），仅在未启用MPSA-only模式时使用
+        if not use_alignins_mpsa_only:
+            benign_idx2 = set(range(num_chosen_clients))
+            benign_idx2.intersection_update(
+                set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
 
         ######## 计算MPSA和TDA的Precision并打印 ########
         def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
@@ -359,29 +364,34 @@ class Aggregation():
         else:
             logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
 
-        # TDA的Precision
-        tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
-        if tda_precision is not None:
-            logging.info(
-                f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
-        else:
-            logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
+        # TDA的Precision（仅在未启用MPSA-only模式时计算）
+        if not use_alignins_mpsa_only:
+            tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
+            if tda_precision is not None:
+                logging.info(
+                    f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
+            else:
+                logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
 
-        ######## 后续原有逻辑 ########
-        benign_set = benign_idx2.intersection(benign_idx1)
-        benign_idx = list(benign_set)
+        ######## 后续逻辑：根据开关决定是否只用MPSA ########
+        if use_alignins_mpsa_only:
+            benign_idx = list(benign_idx1)
+        else:
+            benign_set = benign_idx2.intersection(benign_idx1)
+            benign_idx = list(benign_set)
         if len(benign_idx) == 0:
             return torch.zeros_like(local_updates[0])
 
         benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
 
-        ######## Post-filtering model clipping ########
-        updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
-        norm_clip = updates_norm.median(dim=0)[0].item()
-        benign_updates = torch.stack(local_updates, dim=0)
-        updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
-        updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
-        benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
+        ######## Post-filtering model clipping（仅在未启用MPSA-only模式时执行） ########
+        if not use_alignins_mpsa_only:
+            updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+            norm_clip = updates_norm.median(dim=0)[0].item()
+            benign_updates = torch.stack(local_updates, dim=0)
+            updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+            updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
+            benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
 
         ######## 原有TPR/FPR计算 ########
         correct = 0
@@ -403,7 +413,16 @@ class Aggregation():
         logging.info('FPR:       %.4f' % FPR)
         logging.info('TPR:       %.4f' % TPR)
 
-        current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        # 构造当前轮聚合所用的客户端更新
+        # - 默认模式（包含TDA与剪裁）：benign_updates 经过全体客户端的剪裁，索引与 chosen_clients 对齐
+        # - MPSA-only 模式：benign_updates 只包含 benign_idx 顺序对应的更新，需要用位置索引映射
+        if not use_alignins_mpsa_only:
+            current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        else:
+            current_dict = {
+                chosen_clients[idx]: benign_updates[pos]
+                for pos, idx in enumerate(benign_idx)
+            }
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
    

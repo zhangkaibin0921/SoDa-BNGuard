@@ -102,6 +102,8 @@ if __name__ == "__main__":
                         help="whether to run MPSA prefilter before Scope wave expansion")
     parser.add_argument("--fedid_reg", type=float, default=1e-3,
                         help="regularization coefficient for FedID-style dynamic weighting")
+    parser.add_argument("--use_alignins_mpsa_only", type=bool, default=False,
+                        help="if True, AlignIns aggregation only uses MPSA (no TDA or post-filter clipping)")
     args = parser.parse_args()
     
     
