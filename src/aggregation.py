@@ -441,8 +441,8 @@ class Aggregation():
         lambda_s = getattr(self.args, "lambda_s", 1.0)
         percent_select = float(getattr(self.args, "percent_select", 20.0))
         combine_method = getattr(self.args, "combine_method", "max")
-        use_candidate_seed = getattr(self.args, "use_candidate_seed", True)
-        use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", True)
+        use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
+        use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", False)
         self.candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.25))
         # FedID dynamic weighting regularization coefficient
         self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))

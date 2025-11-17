@@ -17,16 +17,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ("yes", "true", "t", "1", "y"):
-        return True
-    if v.lower() in ("no", "false", "f", "0", "n"):
-        return False
-    raise argparse.ArgumentTypeError("Boolean value expected.")
-
-
 if __name__ == "__main__":
     
     torch.backends.cudnn.enabled = True
@@ -104,15 +94,15 @@ if __name__ == "__main__":
     parser.add_argument("--combine_method", type=str, default="max",
                         choices=["euclidean", "max", "mahalanobis", "fedid_dynamic"],
                         help="how to combine multi-metric distance matrices in agg_scope_multimetric")
-    parser.add_argument("--use_candidate_seed", type=str2bool, default=True,
-                        help="whether to use candidate seed strategy before selecting final seed")
+    parser.add_argument("--use_candidate_seed", action="store_true", default=False,
+                        help="enable candidate seed strategy before selecting final seed")
     parser.add_argument("--candidate_seed_ratio", type=float, default=0.25,
                         help="ratio of allowed clients kept as candidate seeds")
-    parser.add_argument("--use_mpsa_prefilter", type=str2bool, default=True,
-                        help="whether to run MPSA prefilter before Scope wave expansion")
+    parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False,
+                        help="enable MPSA prefilter before Scope wave expansion")
     parser.add_argument("--fedid_reg", type=float, default=1e-3,
                         help="regularization coefficient for FedID-style dynamic weighting")
-    parser.add_argument("--use_alignins_mpsa_only", type=str2bool, default=False,
+    parser.add_argument("--use_alignins_mpsa_only", action="store_true", default=False,
                         help="if True, AlignIns aggregation only uses MPSA (no TDA or post-filter clipping)")
     args = parser.parse_args()
     
