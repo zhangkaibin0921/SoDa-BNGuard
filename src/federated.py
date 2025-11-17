@@ -73,15 +73,35 @@ if __name__ == "__main__":
     parser.add_argument('--alpha',type=float, default=0.5)
     parser.add_argument('--attack',type=str, default="soda", choices=['soda', 'og'])
     parser.add_argument('--aggr', type=str, default='avg', choices=['avg', 'bnguard', 'rlr', 'mkrum', 'signguard',
-                                                                    'mmetric', 'foolsgold', 'rfa', 'deepsight', 'flame',"alignins", "scopemm"],
+                                                                    'mmetric', 'foolsgold', 'rfa', 'deepsight', 'flame', 'alignins', 'scopemm'],
                         help="aggregation function to aggregate agents' local weights")
     parser.add_argument('--lr_decay',type=float, default=0.99)
     parser.add_argument('--momentum',type=float, default=0.0)
     parser.add_argument('--wd', type=float, default= 1e-4)
     parser.add_argument('--exp_name_extra', type=str, default='')
-    parser.add_argument("--sparsity", type=float, default=0.3)
-    parser.add_argument("--lambda_s", type=float, default=1.0)
-    parser.add_argument("--lambda_c", type=float, default=1.0)
+
+    # Scope / multi-metric defense related hyper-parameters
+    parser.add_argument("--sparsity", type=float, default=0.3,
+                        help="top-k sparsity ratio for MPSA-style metrics")
+    parser.add_argument("--lambda_s", type=float, default=1.0,
+                        help="MPSA MZ-score threshold for benign selection")
+    parser.add_argument("--lambda_c", type=float, default=1.0,
+                        help="TDA MZ-score threshold (AlignIns etc.)")
+    parser.add_argument("--eps", type=float, default=1e-12,
+                        help="small epsilon to avoid division by zero in multi-metric distances")
+    parser.add_argument("--percent_select", type=float, default=20.0,
+                        help="initial percentage for Scope-style wave expansion")
+    parser.add_argument("--combine_method", type=str, default="max",
+                        choices=["euclidean", "max", "mahalanobis", "fedid_dynamic"],
+                        help="how to combine multi-metric distance matrices in agg_scope_multimetric")
+    parser.add_argument("--use_candidate_seed", type=bool, default=True,
+                        help="whether to use candidate seed strategy before selecting final seed")
+    parser.add_argument("--candidate_seed_ratio", type=float, default=0.25,
+                        help="ratio of allowed clients kept as candidate seeds")
+    parser.add_argument("--use_mpsa_prefilter", type=bool, default=True,
+                        help="whether to run MPSA prefilter before Scope wave expansion")
+    parser.add_argument("--fedid_reg", type=float, default=1e-3,
+                        help="regularization coefficient for FedID-style dynamic weighting")
     args = parser.parse_args()
     
     
