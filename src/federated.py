@@ -96,7 +96,7 @@ if __name__ == "__main__":
                         help="how to combine multi-metric distance matrices in agg_scope_multimetric")
     parser.add_argument("--use_candidate_seed", action="store_true", default=False,
                         help="enable candidate seed strategy before selecting final seed")
-    parser.add_argument("--candidate_seed_ratio", type=float, default=0.25,
+    parser.add_argument("--candidate_seed_ratio", type=float, default=0.5,
                         help="ratio of allowed clients kept as candidate seeds")
     parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False,
                         help="enable MPSA prefilter before Scope wave expansion")
